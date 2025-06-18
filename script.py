@@ -1,77 +1,95 @@
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.neural_network import MLPClassifier
 import pandas as pd
-from typing import List, Dict, Tuple
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout
+import matplotlib.pyplot as plt
+
+# ==================== 1. Создаём искусственные данные ====================
+random_data_size = 100
+
+data = {
+    "user_id": range(1, random_data_size + 1),
+    "topic_completed": np.random.choice(["variables", "functions", "lists", "OOP", "decorators"], random_data_size),
+    "errors": np.random.randint(1, 10, random_data_size),
+    "time_spent": np.random.randint(10, 60, random_data_size),
+    "difficulty": np.random.choice(["easy", "medium", "hard"], random_data_size),
+    "next_topic": np.random.choice(["functions", "lists", "OOP", "decorators", "generators"], random_data_size)
+}
+
+df = pd.DataFrame(data)
 
 
-class TaskRecommender:
-    def __init__(self):
-        self.vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
-        self.mlp = MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=1000, random_state=42)
-        self.tasks = pd.DataFrame(columns=['id', 'text', 'difficulty', 'solved'])
-        self.task_vectors = None
+# ==================== 2. Предобработка данных ====================
+# Кодируем текст в числа
+label_encoders = {}
+for column in ["topic_completed", "difficulty", "next_topic"]:
+    le = LabelEncoder()
+    df[column] = le.fit_transform(df[column])
+    label_encoders[column] = le
 
-    def add_tasks(self, tasks: List[Dict]):
-        """Добавляет новые задачи в систему."""
-        new_data = pd.DataFrame(tasks)
-        self.tasks = pd.concat([self.tasks, new_data], ignore_index=True)
+# Разделяем данные
+X = df[["topic_completed", "errors", "time_spent", "difficulty"]]
+y = df["next_topic"]
 
-        if len(self.tasks) > 0:
-            self.task_vectors = self.vectorizer.fit_transform(self.tasks['text'])
+# Нормализуем
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
 
-    def train_difficulty_model(self, X: List[str], y: List[int]):
-        """Обучает модель оценки сложности."""
-        X_vec = self.vectorizer.transform(X)
-        self.mlp.fit(X_vec, y)
+# Разделяем на обучающую и тестовую выборки
+X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
 
-    def get_recommendations(self, solved_task_ids: List[int], n_recommendations: int = 3) -> List[Tuple[int, float]]:
-        """Рекомендует задачи на основе решённых."""
-        if len(self.tasks) == 0 or self.task_vectors is None:
-            return []
+# ==================== 3. Создаём и обучаем модель ====================
+model = Sequential([
+    Dense(128, activation='selu', input_shape=(X_train.shape[1],)),
+    #Dropout(0.3),
+    Dense(64, activation='selu'),
+    Dense(32, activation='selu'),
+    Dense(len(label_encoders["next_topic"].classes_), activation='softmax')
+])
 
-        # Получаем индексы решённых и нерешённых задач
-        solved_indices = self.tasks[self.tasks['id'].isin(solved_task_ids)].index
-        unsolved_indices = self.tasks[~self.tasks['id'].isin(solved_task_ids)].index
+model.compile(optimizer='adam',
+              loss='sparse_categorical_crossentropy',
+              metrics=['accuracy'])
 
-        if len(solved_indices) == 0:
-            # Если нет решённых, рекомендуем случайные
-            unsolved_tasks = self.tasks.iloc[unsolved_indices].sample(min(n_recommendations, len(unsolved_indices)))
-            return list(zip(unsolved_tasks['id'], [1.0] * len(unsolved_tasks)))
-
-        # Вычисляем средний вектор решённых задач и преобразуем в массив
-        solved_vectors = self.task_vectors[solved_indices]
-        avg_solved_vector = np.asarray(np.mean(solved_vectors, axis=0))  # Ключевое исправление
-
-        # Вычисляем сходство с нерешёнными задачами
-        unsolved_vectors = self.task_vectors[unsolved_indices]
-        similarities = cosine_similarity(avg_solved_vector.reshape(1, -1), unsolved_vectors).flatten()
-
-        # Выбираем топ-N рекомендаций
-        unsolved_ids = self.tasks.iloc[unsolved_indices]['id'].values
-        top_indices = np.argsort(similarities)[-n_recommendations:][::-1]
-
-        return [(unsolved_ids[i], similarities[i]) for i in top_indices]
+history = model.fit(X_train, y_train,
+                    epochs=300,
+                    batch_size=30,
+                    validation_data=(X_test, y_test),
+                    verbose=1)
 
 
-# Пример использования
-if __name__ == "__main__":
-    recommender = TaskRecommender()
+# ==================== 4. Функция для рекомендаций ====================
+def recommend_next_topic(topic_completed, errors, time_spent, difficulty):
+    # Кодируем входные данные
+    topic_encoded = label_encoders["topic_completed"].transform([topic_completed])[0]
+    difficulty_encoded = label_encoders["difficulty"].transform([difficulty])[0]
 
-    tasks = [
-        {"id": 1, "text": "Write a function to add two numbers.", "difficulty": 1, "solved": False},
-        {"id": 2, "text": "Implement a stack using lists in Python.", "difficulty": 2, "solved": False},
-        {"id": 3, "text": "Create a recursive Fibonacci function.", "difficulty": 3, "solved": False},
-        {"id": 4, "text": "Write a Python decorator to measure function execution time.", "difficulty": 4,
-         "solved": False},
-    ]
-    recommender.add_tasks(tasks)
+    # Нормализуем
+    input_data = scaler.transform([[topic_encoded, errors, time_spent, difficulty_encoded]])
 
-    solved_ids = [1, 2]
-    recommendations = recommender.get_recommendations(solved_ids)
+    # Предсказываем
+    probabilities = model.predict(input_data, verbose=0)[0]
+    predicted_topic_idx = probabilities.argmax()
 
-    print("Рекомендуемые задачи:")
-    for task_id, similarity in recommendations:
-        task = next(t for t in tasks if t["id"] == task_id)
-        print(f"ID: {task_id}, Сходство: {similarity:.2f}, Текст: {task['text']}")
+    # Декодируем название темы
+    return label_encoders["next_topic"].inverse_transform([predicted_topic_idx])[0]
+
+
+# ==================== 5. Пример использования ====================
+# Выведем оригинальные данные для наглядности
+print("Первые 5 строк исходных данных:")
+print(df.head())
+
+# Тестируем рекомендацию
+print("\nРекомендация для ученика, который изучил 'functions', сделал 4 ошибки, потратил 30 минут, сложность 'medium':")
+print(recommend_next_topic("functions", 4, 30, "medium"))
+
+# ==================== 6. Визуализация точности ====================
+plt.plot(history.history['accuracy'], label='Точность на обучении')
+plt.plot(history.history['val_accuracy'], label='Точность на валидации')
+plt.xlabel('Эпохи')
+plt.ylabel('Точность')
+plt.legend()
+plt.show()
